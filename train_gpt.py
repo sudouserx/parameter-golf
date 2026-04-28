@@ -669,6 +669,8 @@ def gptq_loop(W: Tensor, hessian_inv: Tensor, scale: Tensor, qzero: Tensor,
 @torch.no_grad()
 def quantize_weight_matrix_gptq(weight: Tensor, calib_hessian: Tensor,
                                 damp_ratio: float = 1e-2) -> Dict:
+    if weight.device != calib_hessian.device:
+        weight = weight.to(calib_hessian.device)
     dtype = weight.dtype
     device = weight.device
     n_out, n_in = weight.shape  # (R, C)
