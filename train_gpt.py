@@ -811,6 +811,7 @@ class CalibrationCollector:
         self.accumulators: Dict[str, HessianAccumulator] = {}
         self.hooks = []
         self.device = device
+        self.model = model
         self._register_hooks(model)
 
     def _hook_fn(self, name: str):
@@ -834,8 +835,8 @@ class CalibrationCollector:
 
     @torch.no_grad()
     def collect(self, data_loader, num_tokens: int):
-        model = self.hooks[0].__self__ if self.hooks else None
-        if model is None:
+        model = self.model
+        if model is None or not self.hooks:
             return
         model.eval()
         remaining = num_tokens
