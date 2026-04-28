@@ -493,9 +493,16 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-# -----------------------------
-# TRANSFORMER MODULES (with fused implementations)
-# -----------------------------
+
+class RMSNorm(nn.Module):
+    """Simple RMSNorm used for the final layer norm."""
+    def __init__(self, eps: float | None = None):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+
 
 class CastedLinear(nn.Linear):
     """Keep weights in fp32, cast at matmul time for bf16 compute."""
@@ -503,29 +510,26 @@ class CastedLinear(nn.Linear):
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
 
-# ----------------------------------------------------------------------
-# FUSED MODULE 1: RMSNorm + CastedLinear
-# This replaces two separate operations (RMSNorm then CastedLinear) with a
-# single compiled forward pass, reducing kernel launches and memory traffic.
-# ----------------------------------------------------------------------
-class FusedNormLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, eps: float | None = None):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.float32))
-        self.bias = nn.Parameter(torch.empty(out_features, dtype=torch.float32)) if bias else None
-        self.eps = eps
-        self._zero_init = False  # for weight init
 
-    @torch.compile(dynamic=False)
+# ----------------------------------------------------------------------
+# FUSED MODULE 1: RMSNorm + Linear (subclass of nn.Linear for proper init)
+# ----------------------------------------------------------------------
+class FusedNormLinear(nn.Linear):
+    """Fused RMSNorm + linear layer. Inherits nn.Linear's parameter init."""
+    def __init__(self, in_features: int, out_features: int, bias: bool = False, eps: float | None = None):
+        super().__init__(in_features, out_features, bias=bias)
+        self.eps = eps
+        self._zero_init = False  # set to True for projection layers
+
     def forward(self, x: Tensor) -> Tensor:
-        # RMSNorm (in-place style) followed by linear with weight cast.
+        # RMSNorm first, then linear with weight cast
         x = F.rms_norm(x, (x.size(-1),), eps=self.eps)
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(dtype=x.dtype), bias)
 
+
 # ----------------------------------------------------------------------
 # FUSED MODULE 2: Token Embedding + RMSNorm
-# Looks up embedding and immediately normalizes, hiding the intermediate tensor.
 # ----------------------------------------------------------------------
 class FusedEmbeddingNorm(nn.Module):
     def __init__(self, vocab_size: int, embed_dim: int, eps: float | None = None):
@@ -533,7 +537,6 @@ class FusedEmbeddingNorm(nn.Module):
         self.embed = nn.Embedding(vocab_size, embed_dim)
         self.eps = eps
 
-    @torch.compile(dynamic=False)
     def forward(self, idx: Tensor) -> Tensor:
         x = self.embed(idx)
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
@@ -598,7 +601,7 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        # Use fused norm+linear for all projections
+        # Use fused norm+linear for Q, K, V projections
         self.c_q = FusedNormLinear(dim, dim, bias=False)
         self.c_k = FusedNormLinear(dim, kv_dim, bias=False)
         self.c_v = FusedNormLinear(dim, kv_dim, bias=False)
@@ -613,7 +616,6 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        # QK norm is now part of c_q/c_k forward, but they are applied before RoPE – correct.
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -624,7 +626,7 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """relu^2 MLP with fused norm+linear"""
+    """relu^2 MLP with fused norm+linear for the first layer."""
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
@@ -648,7 +650,7 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
-        # attn_norm and mlp_norm are now fused inside the attention and MLP modules
+        # No separate norm modules – norms are fused inside attention and MLP
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -658,11 +660,9 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        # Attention now receives x directly (norm is inside)
-        attn_out = self.attn(x)
+        attn_out = self.attn(x)          # norm is inside
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        # MLP also receives x directly (norm inside)
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(x)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(x)   # norm inside
         return x
 
 
@@ -687,7 +687,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        # Embedding + RMSNorm are fused
+        # Fused embedding + RMSNorm
         self.tok_emb = FusedEmbeddingNorm(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -706,7 +706,7 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.final_norm = RMSNorm()
+        self.final_norm = RMSNorm()   # used after the last transformer block
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -716,14 +716,11 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.embed.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
-            # FusedNormLinear weight init: treat the weight like a CastedLinear
-            if isinstance(module, FusedNormLinear) and getattr(module, "_zero_init", False):
+            if isinstance(module, (nn.Linear, FusedNormLinear)) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        # The fused embedding already applies RMSNorm
+        # Embedding already includes RMSNorm
         x = self.tok_emb(input_ids)
         x0 = x
         skips: list[Tensor] = []
@@ -747,7 +744,6 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
-
 
 # -----------------------------
 # TRAINING
