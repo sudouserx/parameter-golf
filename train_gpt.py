@@ -255,8 +255,7 @@ def eval_val(
             local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+            batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -493,9 +492,11 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
+# -----------------------------
+# TRANSFORMER MODULES
+# -----------------------------
 
 class RMSNorm(nn.Module):
-    """Simple RMSNorm used for the final layer norm."""
     def __init__(self, eps: float | None = None):
         super().__init__()
         self.eps = eps
@@ -505,45 +506,14 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    """Keep weights in fp32, cast at matmul time for bf16 compute."""
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-# ----------------------------------------------------------------------
-# FUSED MODULE 1: RMSNorm + Linear (subclass of nn.Linear for proper init)
-# ----------------------------------------------------------------------
-class FusedNormLinear(nn.Linear):
-    """Fused RMSNorm + linear layer. Inherits nn.Linear's parameter init."""
-    def __init__(self, in_features: int, out_features: int, bias: bool = False, eps: float | None = None):
-        super().__init__(in_features, out_features, bias=bias)
-        self.eps = eps
-        self._zero_init = False  # set to True for projection layers
-
-    def forward(self, x: Tensor) -> Tensor:
-        # RMSNorm first, then linear with weight cast
-        x = F.rms_norm(x, (x.size(-1),), eps=self.eps)
-        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(dtype=x.dtype), bias)
-
-
-# ----------------------------------------------------------------------
-# FUSED MODULE 2: Token Embedding + RMSNorm
-# ----------------------------------------------------------------------
-class FusedEmbeddingNorm(nn.Module):
-    def __init__(self, vocab_size: int, embed_dim: int, eps: float | None = None):
-        super().__init__()
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.eps = eps
-
-    def forward(self, idx: Tensor) -> Tensor:
-        x = self.embed(idx)
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    """Keep small/control parameters in fp32."""
+    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
@@ -551,7 +521,7 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    """Caches cos/sin tables per sequence length on the current device."""
+    # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -601,10 +571,9 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        # Use fused norm+linear for Q, K, V projections
-        self.c_q = FusedNormLinear(dim, dim, bias=False)
-        self.c_k = FusedNormLinear(dim, kv_dim, bias=False)
-        self.c_v = FusedNormLinear(dim, kv_dim, bias=False)
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -612,10 +581,11 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        # c_q, c_k, c_v already apply RMSNorm internally
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
@@ -633,11 +603,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """relu^2 MLP with fused norm+linear for the first layer."""
+    # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = FusedNormLinear(dim, hidden, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
@@ -657,7 +627,8 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
-        # No separate norm modules – norms are fused inside attention and MLP
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -667,9 +638,9 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(x)          # norm is inside
+        attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(x)   # norm inside
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -694,8 +665,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        # Fused embedding + RMSNorm
-        self.tok_emb = FusedEmbeddingNorm(vocab_size, model_dim)
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -713,7 +683,7 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        self.final_norm = RMSNorm()   # used after the last transformer block
+        self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -721,14 +691,14 @@ class GPT(nn.Module):
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.embed.weight, mean=0.0, std=self.tied_embed_init_std)
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, (nn.Linear, FusedNormLinear)) and getattr(module, "_zero_init", False):
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        # Embedding already includes RMSNorm
         x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
@@ -744,13 +714,14 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.embed.weight)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         return F.cross_entropy(logits.float(), targets, reduction="mean")
+
 
 # -----------------------------
 # TRAINING
@@ -865,13 +836,17 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, (CastedLinear, FusedNormLinear)):
-            module.float()   # keep linear weights fp32
+        if isinstance(module, CastedLinear):
+            module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split (unchanged except parameter collection now includes FusedNormLinear weights)
+    # Optimizer split:
+    # - token embedding (Adam) uses EMBED_LR
+    # - untied lm_head (Adam) uses HEAD_LR
+    # - matrix params in transformer blocks use MATRIX_LR via Muon
+    # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p
@@ -887,7 +862,7 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.embed.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -956,7 +931,8 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Warmup primes the compiled forward/backward/optimizer paths
+    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
+    # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -967,8 +943,7 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1035,8 +1010,7 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+            loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1068,7 +1042,7 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
-        # Sync wallclock cap across ranks
+        # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
@@ -1085,6 +1059,8 @@ def main() -> None:
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
+    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
+    # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
